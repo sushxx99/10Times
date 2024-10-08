@@ -1,0 +1,126 @@
+#Install Required Libraries: 
+pip install feedparser
+pip install SQLAlchemy
+pip install psycopg2-binary  # For PostgreSQL interaction
+pip install celery
+pip install nltk
+pip install spacy
+python -m spacy download en_core_web_sm  # Download spaCy language model
+
+#Set Up the Database:
+createdb news_articles
+
+#Create a Script for Parsing Feeds: Create a file named rss_feed_parser.py:
+import feedparser
+
+def parse_rss_feed(feed_url):
+    feed = feedparser.parse(feed_url)
+    articles = []
+    for entry in feed.entries:
+        article = {
+            'title': entry.title,
+            'content': entry.get('summary', ''),
+            'publication_date': entry.published,
+            'source_url': entry.link
+        }
+        articles.append(article)
+    return articles
+
+# List of RSS feeds
+rss_feeds = [
+    "http://rss.cnn.com/rss/cnn_topstories.rss",
+    "http://qz.com/feed",
+    "http://feeds.foxnews.com/foxnews/politics",
+    "http://feeds.reuters.com/reuters/businessNews",
+    "http://feeds.feedburner.com/NewshourWorld",
+    "https://feeds.bbci.co.uk/news/world/asia/india/rss.xml"
+]
+
+# Extract articles from each feed
+for feed in rss_feeds:
+    articles = parse_rss_feed(feed)
+    print(f"Extracted {len(articles)} articles from {feed}")
+
+#Design the Database Schema: Create a file named database_setup.py:
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, UniqueConstraint
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+
+Base = declarative_base()
+engine = create_engine('postgresql://username:password@localhost/news_articles')
+Session = sessionmaker(bind=engine)
+session = Session()
+
+class NewsArticle(Base):
+    __tablename__ = 'articles'
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    title = Column(String, nullable=False)
+    content = Column(String, nullable=False)
+    publication_date = Column(DateTime, nullable=False)
+    source_url = Column(String, nullable=False, unique=True)
+    category = Column(String)
+
+    __table_args__ = (UniqueConstraint('title', 'source_url', name='unique_article'),)
+
+Base.metadata.create_all(engine)
+
+#Storing Articles to the Database: Modify the rss_feed_parser.py to save articles to the database:
+from database_setup import NewsArticle, session
+from datetime import datetime
+
+def save_articles_to_db(articles):
+    for article in articles:
+        existing_article = session.query(NewsArticle).filter_by(source_url=article['source_url']).first()
+        if not existing_article:
+            new_article = NewsArticle(
+                title=article['title'],
+                content=article['content'],
+                publication_date=datetime.strptime(article['publication_date'], '%a, %d %b %Y %H:%M:%S %Z'),
+                source_url=article['source_url']
+            )
+            session.add(new_article)
+    session.commit()
+
+#Set Up Celery: Create a file named celery_tasks.py:
+from celery import Celery
+from rss_feed_parser import parse_rss_feed, save_articles_to_db
+from text_classification import categorize_article
+
+app = Celery('news_collector', broker='redis://localhost:6379/0')
+
+@app.task
+def process_feed(feed_url):
+    articles = parse_rss_feed(feed_url)
+    categorized_articles = [(article, categorize_article(article['content'])) for article in articles]
+    save_articles_to_db(categorized_articles)
+
+#Configure Celery Worker: Run the Celery worker to process tasks asynchronously:
+celery -A celery_tasks worker --loglevel=info
+
+#Implement Text Classification: Create a file named text_classification.py:
+
+import spacy
+nlp = spacy.load('en_core_web_sm')
+
+categories = {
+    'Terrorism': ['attack', 'protest', 'riot'],
+    'Positive/Uplifting': ['success', 'innovation', 'achievement'],
+    'Natural Disasters': ['flood', 'earthquake', 'storm'],
+    'Others': []
+}
+
+def categorize_article(content):
+    doc = nlp(content.lower())
+    for category, keywords in categories.items():
+        if any(keyword in doc.text for keyword in keywords):
+            return category
+    return 'Others'
+
+#Update Articles with Category: Modify the save_articles_to_db() function to store the category in the database:
+new_article.category = article['category']
+
+#Implement Logging: Add logging functionality to track errors in rss_feed_parser.py and celery_tasks.py:
+import logging
+logging.basicConfig(level=logging.INFO)
+
+#Error Handling: Implement try-except blocks around the feed parsing and database interaction to handle network issues and data errors.
